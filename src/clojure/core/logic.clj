@@ -8,6 +8,12 @@
            [clojure.core.logic.protocols
             IBindable ITreeTerm IVar ITreeConstraint INonStorable]))
 
+(defmacro ^:private compile-when
+  ([exp then]
+     (if (try (eval exp)
+              (catch Exception _ false))
+       `(do ~then))))
+
 (def ^{:dynamic true} *locals*)
 
 (def fk (Exception.))
@@ -27,8 +33,9 @@
 (defn dissoc-dom [x k]
   (assoc x :doms (dissoc (:doms x) k)))
 
-(defn record? [x]
-  (instance? clojure.lang.IRecord x))
+(compile-when (not (resolve 'clojure.core/record?))
+  (defn record? [x]
+    (instance? clojure.lang.IRecord x)))
 
 ;; =============================================================================
 ;; Pair
@@ -1041,7 +1048,7 @@
      `(mplus ~e (fn [] (mplus* ~@e-rest)))))
 
 (defmacro -inc [& rest]
-  `(fn -inc [] ~@rest))
+  `(fn ~'-inc [] ~@rest))
 
 (extend-type Object
   ITake
@@ -1690,219 +1697,6 @@
       (choice (first aseq)
               (fn [] (to-stream (next aseq)))))))
 
-(defmacro def-arity-exc-helper []
-  (if                                                                        ;;; (try
-    (clojure.lang.RT/classForName "clojure.lang.ArityException")             ;;;   (Class/forName "clojure.lang.ArityException")
-    `(defn arity-exc-helper [~'name ~'n]
-       (fn [~'& ~'args]
-         (throw (clojure.lang.ArityException. ~'n (str ~'name)))))
-    ;;;                                                                      ;;;   (catch java.lang.ClassNotFoundException e
-     `(defn ~'arity-exc-helper [~'name ~'n]
-        (fn [~'& ~'args]
-          (throw
-           (java.lang.IllegalArgumentException.
-            (str "Wrong number of args (" ~'n ") passed to:" ~'name)))))))   ;;; )
-
-(def-arity-exc-helper)
-
-(defn- sym-helper [prefix n]
-  (symbol (str prefix n)))
-
-(def f-sym (partial sym-helper "f"))
-(def a-sym (partial sym-helper "a"))
-
-(defn- ->sym [& args]
-  (symbol (apply str args)))
-
-(defn- defrel-helper [name arity args]
-  (let [r (range 1 (+ arity 2))
-        arity-excs (fn [n] `(arity-exc-helper '~name ~n))]
-    (if (seq args)
-      `(do
-         (def ~name
-           (.withMeta
-            (~'clojure.core.logic.Rel.
-             '~name (atom {}) nil ~@(map arity-excs r))
-            {:ns ~'*ns*}))
-         (extend-rel ~name ~@args))
-      `(def ~name
-         (.withMeta
-          (~'clojure.core.logic.Rel. '~name (atom {}) nil ~@(map arity-excs r))
-          {:ns ~'*ns*})))))
-
-(defmacro def-apply-to-helper [n]
-  (let [r (range 1 (clojure.core/inc n))
-        args (map a-sym r)
-        arg-binds (fn [n]
-                    (mapcat (fn [a]
-                              `(~a (first ~'arglist)
-                                   ~'arglist (next ~'arglist)))
-                            (take n args)))
-        case-clause (fn [n]
-                      `(~n (let [~@(arg-binds (dec n))]
-                            (.invoke ~'ifn ~@(take (dec n) args)
-                                     (clojure.lang.Util/ret1
-                                      (first ~'arglist) nil)))))]
-   `(defn ~'apply-to-helper
-      [~(with-meta 'ifn {:tag clojure.lang.IFn}) ~'arglist]
-      (case (clojure.lang.RT/boundedLength ~'arglist 20)
-            ~@(mapcat case-clause r)))))
-
-(def-apply-to-helper 20)
-
-;; TODO: consider moving the set/indexes inside Rel, perf implications?
-
-(defmacro RelHelper [arity]
-  (let [r (range 1 (+ arity 2))
-        fs (map f-sym r)
-        mfs (map #(with-meta % {:volatile-mutable true :tag clojure.lang.IFn})
-                 fs)
-        create-sig (fn [n]
-                     (let [args (map a-sym (range 1 (clojure.core/inc n)))]
-                       `(invoke [~'_ ~@args]
-                                  (~(f-sym n) ~@args))))
-        set-case (fn [[f arity]]
-                   `(~arity (set! ~f ~'f)))]
-    `(do
-       (deftype ~'Rel [~'name ~'indexes ~'meta
-                       ~@mfs]
-         clojure.lang.IObj
-         (~'withMeta [~'_ ~'meta]
-           (~'Rel. ~'name ~'indexes ~'meta ~@fs))
-         (~'meta [~'_]
-           ~'meta)
-         clojure.lang.IFn
-         ~@(map create-sig r)
-         (~'applyTo [~'this ~'arglist]
-            (~'apply-to-helper ~'this ~'arglist))
-         ~'IRel
-         (~'setfn [~'_ ~'arity ~'f]
-           (case ~'arity
-                 ~@(mapcat set-case (map vector fs r))))
-         (~'indexes-for [~'_ ~'arity]
-           ((deref ~'indexes) ~'arity))
-         (~'add-indexes [~'_ ~'arity ~'index]
-           (swap! ~'indexes assoc ~'arity ~'index)))
-       (defmacro ~'defrel 
-         "Define a relation for adding facts. Takes a name and some fields.
-         Use fact/facts to add facts and invoke the relation to query it."
-         [~'name ~'& ~'rest]
-         (defrel-helper ~'name ~arity ~'rest)))))
-
-(RelHelper 20)
-
-(defn- index-sym [name arity o]
-  (->sym name "_" arity "-" o "-index"))
-
-(defn- set-sym [name arity]
-  (->sym name "_" arity "-set"))
-
-;; TODO: for arity greater than 20, we need to use rest args
-
-(defn contains-lvar? [x]
-  (some lvar? (tree-seq coll? seq x)))
-
-(defmacro extend-rel [name & args]
-  (let [arity (count args)
-        r (range 1 (clojure.core/inc arity))
-        as (map a-sym r)
-        indexed (vec (filter (fn [[a i]]
-                               (-> a meta :index))
-                             (map vector
-                                  args
-                                  (range 1 (clojure.core/inc arity)))))
-        check-lvar (fn [[o i]]
-                     (let [a (a-sym i)]
-                       `((not (clojure.core.logic/contains-lvar? (clojure.core.logic/walk* ~'a ~a)))
-                         ((deref ~(index-sym name arity o)) (clojure.core.logic/walk* ~'a ~a)))))
-        indexed-set (fn [[o i]]
-                      `(def ~(index-sym name arity o) (atom {})))]
-    (if (<= arity 20)
-     `(do
-        (def ~(set-sym name arity) (atom #{}))
-        ~@(map indexed-set indexed)
-        (add-indexes ~name ~arity '~indexed)
-        (setfn ~name ~arity
-               (fn [~@as]
-                 (fn [~'a]
-                   (let [set# (cond
-                               ~@(mapcat check-lvar indexed)
-                               :else (deref ~(set-sym name arity)))]
-                     (to-stream
-                      (->> set#
-                           (map (fn [cand#]
-                                  (when-let [~'a (clojure.core.logic/unify ~'a [~@as] cand#)]
-                                    ~'a)))))))))))))
-
-;; TODO: Should probably happen in a transaction
-
-(defn facts
-  "Define a series of facts. Takes a vector of vectors where each vector
-   represents a fact tuple, all with the same number of elements."
-  ([rel [f :as tuples]] (facts rel (count f) tuples))
-  ([^Rel rel arity tuples]
-     (let [rel-ns (:ns (meta rel))
-           rel-set (var-get (ns-resolve rel-ns (set-sym (.name rel) arity)))
-           tuples (map vec tuples)]
-       (swap! rel-set (fn [s] (into s tuples)))
-       (let [indexes (indexes-for rel arity)]
-         (doseq [[o i] indexes]
-           (let [index (var-get (ns-resolve rel-ns (index-sym (.name rel) arity o)))]
-             (let [indexed-tuples (map (fn [t]
-                                         {(nth t (dec i)) #{t}})
-                                       tuples)]
-               (swap! index
-                      (fn [i]
-                        (apply merge-with set/union i indexed-tuples))))))))))
-
-(defn fact
-  "Add a fact to a relation defined with defrel."
-  [rel & tuple]
-  (facts rel [(vec tuple)]))
-
-(defn difference-with
-  "Returns a map that consists of the first map with the rest of the maps
-   removed from it. When a key is found in the first map and a later map,
-   the value from the later map will be combined with the value in the first
-   map by calling (f val-in-first val-in-later). If this function returns nil
-   then the key will be removed completely."
-  [f & maps]
-  (when (some identity maps)
-    (let [empty-is-nil (fn [s] (if (empty? s) nil s))
-          merge-entry (fn [m [k v]]
-                         (if (contains? m k)
-                           (if-let [nv (empty-is-nil (f (get m k) v))]
-                             (assoc m k nv)
-                             (dissoc m k))
-                           m))
-          merge-map (fn [m1 m2] (reduce merge-entry (or m1 {}) (seq m2)))]
-      (reduce merge-map maps))))
-
-(defn retractions
-  "Retract a series of facts. Takes a vector of vectors where each vector
-   represents a fact tuple, all with the same number of elements. It is not
-   an error to retract a fact that isn't true."
-  ([rel [f :as tuples]]
-     (when f (retractions rel (count f) tuples)))
-  ([^Rel rel arity tuples]
-     (let [rel-ns (:ns (meta rel))
-           rel-set (var-get (ns-resolve rel-ns (set-sym (.name rel) arity)))
-           tuples (map vec tuples)]
-       (swap! rel-set (fn [s] (reduce disj s tuples)))
-       (let [indexes (indexes-for rel arity)]
-         (doseq [[o i] indexes]
-           (let [index (var-get (ns-resolve rel-ns (index-sym (.name rel) arity o)))]
-             (let [indexed-tuples (map (fn [t]
-                                         {(nth t (dec i)) #{t}})
-                                       tuples)]
-               (swap! index
-                      (fn [i]
-                        (apply difference-with set/difference i indexed-tuples))))))))))
-
-(defn retraction
-  "Remove a fact from a relation defined with defrel."
-  [rel & tuple]
-  (retractions rel [(vec tuple)]))
 
 ;; =============================================================================
 ;; Tabling
@@ -1968,7 +1762,7 @@
 
 (defn waiting-stream-check
   "Take a waiting stream, a success continuation, and a failure continuation.
-   If we don't find any ready suspended streams, invoke the failure continuation. 
+   If we don't find any ready suspended streams, invoke the failure continuation.
    If we find a ready suspended stream calculate the remainder of the waiting
    stream. If we've reached the fixpoint just call the thunk of the suspended
    stream, otherwise call mplus on the result of the thunk and the remainder
@@ -2101,7 +1895,7 @@
 ;; TODO: consider the concurrency implications much more closely
 
 (defmacro tabled
-  "Macro for defining a tabled goal. Prefer ^:tabled with the 
+  "Macro for defining a tabled goal. Prefer ^:tabled with the
   defne/a/u forms over using this directly."
   [args & grest]
   (let [uuid (symbol (str "tabled-" (Guid/NewGuid)))]                     ;;; (UUID/randomUUID)
@@ -2443,7 +2237,7 @@
             (when-not (= vf ::not-found)
               (if-let [cs (disunify s (get u kf) vf cs)]
                 (recur (next ks) cs)
-                nil))) 
+                nil)))
           cs))
       nil)))
 
@@ -2475,8 +2269,7 @@
 
 (declare normalize-store ground-term?)
 
-(defn !=c
-  [p]
+(defn !=c [p]
   (reify
     ITreeConstraint
     clojure.lang.IFn
@@ -2572,7 +2365,7 @@
      (distincto (lcons h1 t))))
 
 (defne rembero
-  "A relation between l and o where is removed from
+  "A relation between l and o where x is removed from
    l exactly one time."
   [x l o]
   ([_ [x . xs] xs])
@@ -2783,7 +2576,7 @@
         (fc t s)
         (when-let [s (fc (lfirst t) s)]
           (recur (lnext t) s)))))
-  
+
   clojure.lang.Sequential
   (-constrain-tree [t fc s]
     (loop [t (seq t) s s]
